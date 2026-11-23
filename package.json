@@ -1,0 +1,9 @@
+{
+  "name": "ileague-api",
+  "version": "1.0.0",
+  "description": "Serverless Scraping API untuk ileague.id (BRI Super League / Liga 1)",
+  "dependencies": {
+    "axios": "^1.7.7",
+    "cheerio": "^1.0.0"
+  }
+}
