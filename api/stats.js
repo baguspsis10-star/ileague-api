@@ -31,7 +31,6 @@ function extractPlayersFromContainer($, container) {
       const club = texts[1] || '';
       if (!player || /^(pemain|player|nama|klub|club)$/i.test(player)) return;
 
-      // Cari angka statistik terbesar di baris tersebut (bukan nomor urut 1, 2, 3)
       const nums = [];
       row.find('td, span, p, div, strong').each((__, node) => {
         if ($(node).children().length === 0) {
@@ -43,12 +42,23 @@ function extractPlayersFromContainer($, container) {
       const total = nums.length > 0 ? nums[nums.length - 1] : 0;
       if (total === 0 && nums.length === 0) return;
 
-      const photo = imgs.length > 1
-        ? normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'))
-        : null;
-      const clubLogo = imgs.length > 1
-        ? normalizeUrl($(imgs[1]).attr('data-src') || $(imgs[1]).attr('src'))
-        : normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'));
+      let photo = null;
+      let clubLogo = null;
+
+      imgs.each((__, img) => {
+        const src = normalizeUrl($(img).attr('data-src') || $(img).attr('src'));
+        if (!src) return;
+        if (src.includes('/uploads/images/logo/')) {
+          clubLogo = src;
+        } else if (!photo) {
+          photo = src;
+        }
+      });
+
+      if (!clubLogo && imgs.length === 1) {
+        clubLogo = photo;
+        photo = null;
+      }
 
       list.push({
         rank: list.length + 1,
@@ -68,78 +78,51 @@ module.exports = async (req, res) => {
 
   try {
     const { debug } = req.query;
-    const candidatePaths = [
-      `/top_actions/player/${COMPETITION}`,
-      `/top_actions/index/${COMPETITION}`,
-      `/top_actions/club/${COMPETITION}`
-    ];
-
-    let html = '';
-    let usedPath = candidatePaths[0];
-
-    for (const path of candidatePaths) {
-      try {
-        const resp = await httpClient.get(path);
-        if (resp.data && typeof resp.data === 'string' && resp.data.length > 1000) {
-          html = resp.data;
-          usedPath = path;
-          if (html.includes('GOAL') || html.includes('GOL') || html.includes('ASSIST') || cheerio.load(html)('table').length > 0) {
-            break;
-          }
-        }
-      } catch (_) {}
-    }
-
-    const $ = cheerio.load(html);
+    const targetPath = `/top_actions/player/index/${COMPETITION}`;
+    const response = await httpClient.get(targetPath);
+    const $ = cheerio.load(response.data || '');
 
     if (debug === '1') {
       const headings = [];
-      $('h1, h2, h3, h4, .card-header, .nav-tabs a').each((_, el) => {
+      $('h1, h2, h3, h4, h5, .card-header, .nav-tabs a, .title').each((_, el) => {
         const t = cleanText($(el).text());
-        if (t && headings.length < 25) headings.push(t);
-      });
-
-      const playerLinks = [];
-      $('a[href*="/player"], a[href*="/pemain"], a[href*="/top_actions"]').each((_, el) => {
-        const href = $(el).attr('href');
-        const text = cleanText($(el).text());
-        if (href && playerLinks.length < 20) playerLinks.push({ href, text });
+        if (t && headings.length < 30) headings.push(t);
       });
 
       return res.status(200).json({
         success: true,
-        usedPath,
+        targetPath,
         totalTables: $('table').length,
         headings,
-        playerLinks,
-        bodySnippet: cleanText($('main, .content, body').first().text()).slice(0, 1000)
+        bodySnippet: cleanText($('main, .content, body').first().text()).slice(0, 1200)
       });
     }
 
     let topScorers = [];
     let topAssists = [];
 
-    const tables = $('table');
-    if (tables.length >= 1) topScorers = extractPlayersFromContainer($, tables[0]);
-    if (tables.length >= 2) topAssists = extractPlayersFromContainer($, tables[1]);
+    // 1. Cek berdasarkan section/panel/tab berjudul Goal & Assist
+    $('.card, .panel, section, .tab-pane, .box, .col-md-6, .col-lg-6').each((_, box) => {
+      const title = cleanText($(box).find('h2, h3, h4, h5, .card-header, .box-title, .title').first().text()).toUpperCase();
+      if ((title.includes('GOAL') || title.includes('GOL') || title.includes('SCORER')) && topScorers.length === 0) {
+        topScorers = extractPlayersFromContainer($, box);
+      } else if (title.includes('ASSIST') && topAssists.length === 0) {
+        topAssists = extractPlayersFromContainer($, box);
+      }
+    });
 
-    // Jika tidak memakai <table>, cari berdasarkan section/card berjudul Goal & Assist
+    // 2. Fallback berdasarkan urutan tabel jika judul section tidak terdeteksi
     if (topScorers.length === 0 && topAssists.length === 0) {
-      $('.card, .panel, section, .tab-pane, .box').each((_, box) => {
-        const title = cleanText($(box).find('h2, h3, h4, .card-header, .box-title').first().text()).toUpperCase();
-        if ((title.includes('GOAL') || title.includes('GOL') || title.includes('SCORER')) && topScorers.length === 0) {
-          topScorers = extractPlayersFromContainer($, box);
-        } else if (title.includes('ASSIST') && topAssists.length === 0) {
-          topAssists = extractPlayersFromContainer($, box);
-        }
-      });
+      const tables = $('table');
+      if (tables.length >= 1) topScorers = extractPlayersFromContainer($, tables[0]);
+      if (tables.length >= 2) topAssists = extractPlayersFromContainer($, tables[1]);
     }
 
     res.status(200).json({
       success: true,
       source: 'ileague.id',
       competition: COMPETITION,
-      path_used: usedPath,
+      path_used: targetPath,
       updated_at: new Date().toISOString(),
       data: {
         top_scorers: topScorers,
