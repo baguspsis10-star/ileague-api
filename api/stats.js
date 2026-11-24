@@ -1,72 +1,59 @@
 const cheerio = require('cheerio');
 const { httpClient } = require('../lib/httpClient');
-const { normalizeUrl, cleanText, handleCors } = require('../lib/helpers');
+const { normalizeUrl, cleanText, handleCors, extractMatchId } = require('../lib/helpers');
 
 const COMPETITION = 'BRI_SUPER_LEAGUE_2026-27';
 
-function parseStatSection($, section) {
+function parseRankingList($, sectionSelector, logoToClubMap) {
   const players = [];
-  const seen = new Set();
+  const section = $(sectionSelector).first();
+  if (!section.length) return players;
 
-  if (!section || section.length === 0) return players;
+  section.find('ul li').each((index, el) => {
+    const li = $(el);
+    const link = li.find('a[href*="/singleplayer/"]').first();
+    if (!link.length) return;
 
-  section.find('tr, .player-item, .stat-item, .card, li, .row').each((_, el) => {
-    const row = $(el);
-    // Hindari container pembungkus luar yang terlalu besar
-    if (row.find('tr, .player-item, .stat-item').length > 1) return;
+    const shortName = cleanText(link.text());
+    const href = link.attr('href') || '';
+    const fullSlug = extractMatchId(href);
+    const fullName = fullSlug
+      ? fullSlug
+          .replace(/_+/g, ' ')
+          .replace(/\b\w/g, (c) => c.toUpperCase())
+      : shortName;
 
-    const imgs = row.find('img').filter((__, img) => {
-      const src = $(img).attr('data-src') || $(img).attr('src') || '';
-      return src && !src.includes('flagcdn.com') && !src.includes('competition-logo');
-    });
+    const rankText = cleanText(li.find('.position').first().text()).replace(/\D/g, '');
+    const rank = rankText ? parseInt(rankText, 10) : index + 1;
 
-    const texts = [];
-    row.find('td, span, p, div, h3, h4, h5, strong, a').each((__, node) => {
-      if ($(node).children().length === 0) {
-        const t = cleanText($(node).text());
-        if (t && !/^\d+$/.test(t) && /[a-zA-Z]{2,}/.test(t) && !texts.includes(t)) {
-          texts.push(t);
-        }
-      }
-    });
+    const pointsText = cleanText(li.find('.points').first().text()).replace(/\D/g, '');
+    const total = pointsText ? parseInt(pointsText, 10) : 0;
 
-    const player = texts[0] || '';
-    const club = texts[1] || '';
-    if (!player || player.length < 3 || seen.has(player.toLowerCase())) return;
-    if (/^(pemain|player|nama|klub|club|goals|assists|gol|assist)$/i.test(player)) return;
+    // Foto pemain (tersedia pada peringkat 1 / .single-player)
+    const playerImg = li.find('img[src*="/uploads/images/player/"]').first();
+    const photo = playerImg.length
+      ? normalizeUrl(playerImg.attr('data-src') || playerImg.attr('src'))
+      : null;
 
-    const nums = [];
-    row.find('td, span, p, div, strong, b').each((__, node) => {
-      if ($(node).children().length === 0) {
-        const t = cleanText($(node).text());
-        if (/^\d{1,2}$/.test(t)) nums.push(parseInt(t, 10));
-      }
-    });
+    // Logo klub di dalam tautan pemain
+    const clubImg = link.find('img').first().length
+      ? link.find('img').first()
+      : li.find('img[src*="/uploads/images/logo/"]').first();
+    const clubLogo = clubImg.length
+      ? normalizeUrl(clubImg.attr('data-src') || clubImg.attr('src'))
+      : null;
 
-    const total = nums.length > 0 ? nums[nums.length - 1] : 0;
-    if (total === 0) return;
-
-    seen.add(player.toLowerCase());
-
-    let photo = null;
-    let clubLogo = null;
-    imgs.each((__, img) => {
-      const src = normalizeUrl($(img).attr('data-src') || $(img).attr('src'));
-      if (!src) return;
-      if (src.includes('/uploads/images/logo/')) {
-        clubLogo = src;
-      } else if (!photo) {
-        photo = src;
-      }
-    });
+    const clubName = (clubLogo && logoToClubMap.get(clubLogo)) || '';
 
     players.push({
-      rank: players.length + 1,
-      player,
+      rank,
+      player: shortName || fullName,
+      full_name: fullName,
       photo,
-      club,
+      club: clubName,
       club_logo: clubLogo,
-      total
+      total,
+      profile_url: normalizeUrl(href)
     });
   });
 
@@ -77,25 +64,40 @@ module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
   try {
-    const { debug } = req.query;
-    const response = await httpClient.get('/');
-    const $ = cheerio.load(response.data || '');
+    // Ambil halaman utama (#goals & #assists) dan klasemen (untuk mapping nama klub) secara paralel
+    const [homeRes, tableRes] = await Promise.all([
+      httpClient.get('/'),
+      httpClient.get(`/table/index/${COMPETITION}`).catch(() => ({ data: '' }))
+    ]);
 
-    const goalsSection = $('#goals, [id*="goal" i], [data-tab="goals"]').first();
-    const assistsSection = $('#assists, [id*="assist" i], [data-tab="assists"]').first();
+    const logoToClubMap = new Map();
+    if (tableRes && tableRes.data) {
+      const $t = cheerio.load(tableRes.data);
+      $t('table tbody tr').each((_, row) => {
+        const img = $t(row).find('img[src*="/uploads/images/logo/"]').first();
+        const logoUrl = normalizeUrl(img.attr('data-src') || img.attr('src'));
+        if (!logoUrl) return;
 
-    if (debug === '1') {
-      return res.status(200).json({
-        success: true,
-        goalsFound: goalsSection.length > 0,
-        assistsFound: assistsSection.length > 0,
-        goalsHtmlSample: (goalsSection.html() || '').slice(0, 2500),
-        assistsHtmlSample: (assistsSection.html() || '').slice(0, 2500)
+        let clubName = '';
+        $t(row)
+          .find('td')
+          .each((__, col) => {
+            if (clubName) return;
+            const txt = cleanText($t(col).text());
+            if (txt && txt.length >= 3 && /[a-zA-Z]{3,}/.test(txt) && !/^[WDLMSK\s-]+$/i.test(txt)) {
+              clubName = txt;
+            }
+          });
+
+        if (clubName) {
+          logoToClubMap.set(logoUrl, clubName);
+        }
       });
     }
 
-    const topScorers = parseStatSection($, goalsSection);
-    const topAssists = parseStatSection($, assistsSection);
+    const $ = cheerio.load(homeRes.data || '');
+    const topScorers = parseRankingList($, '#goals', logoToClubMap);
+    const topAssists = parseRankingList($, '#assists', logoToClubMap);
 
     res.status(200).json({
       success: true,
