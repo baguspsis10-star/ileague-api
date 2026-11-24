@@ -4,10 +4,27 @@ const { normalizeUrl, cleanText, handleCors } = require('../lib/helpers');
 
 const COMPETITION = 'BRI_SUPER_LEAGUE_2026-27';
 
+function detectEventType(htmlLower, imgSrcLower) {
+  const combined = `${htmlLower} ${imgSrcLower}`;
+  if (combined.includes('goal') || combined.includes('ball') || combined.includes('gol')) {
+    return 'GOAL';
+  }
+  if (combined.includes('yellow') || combined.includes('kuning') || combined.includes('yc')) {
+    return 'YELLOW_CARD';
+  }
+  if (combined.includes('red') || combined.includes('merah') || combined.includes('rc')) {
+    return 'RED_CARD';
+  }
+  if (combined.includes('sub') || combined.includes('exchange') || combined.includes('in_out') || combined.includes('ganti')) {
+    return 'SUBSTITUTION';
+  }
+  return 'EVENT';
+}
+
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
-  const { id, url, debug } = req.query;
+  const { id, url } = req.query;
   if (!id && !url) {
     return res.status(400).json({
       success: false,
@@ -24,30 +41,12 @@ module.exports = async (req, res) => {
     const html = response.data || '';
     const $ = cheerio.load(html);
 
-    if (debug === '1') {
-      const tabIds = [];
-      $('.tab-pane, [id]').each((_, el) => {
-        const elId = $(el).attr('id');
-        if (elId && /stat|lineup|event|summary|timeline|match|goal|card|susunan|ringkasan/i.test(elId)) {
-          tabIds.push(elId);
-        }
-      });
-
-      return res.status(200).json({
-        success: true,
-        targetPath,
-        tabIds,
-        statsHtmlSample: ($('#stats').html() || '').slice(0, 2500),
-        bodySample: cleanText($('body').text()).slice(0, 1200)
-      });
-    }
-
     const urlParts = targetPath.replace(/\/$/, '').split('/');
     const awaySlug = urlParts[urlParts.length - 1] || 'Away';
     const homeSlug = urlParts[urlParts.length - 2] || 'Home';
     const dateFromUrl = urlParts[urlParts.length - 3] || null;
 
-    // 1. Ambil logo klub (hindari header/nav/footer & competition-logo)
+    // 1. Logo klub (abaikan header, nav, footer & competition-logo)
     const clubLogos = [];
     $('img').each((_, img) => {
       if ($(img).closest('header, nav, footer').length > 0) return;
@@ -62,7 +61,7 @@ module.exports = async (req, res) => {
       }
     });
 
-    // 2. Ambil skor pertandingan dari header scoreboard
+    // 2. Skor pertandingan
     let homeScore = null;
     let awayScore = null;
     const scoreCandidates = $('.score, .match-score, .scoreboard h1, .scoreboard h2, .scoreboard h3, .result-score');
@@ -78,7 +77,7 @@ module.exports = async (req, res) => {
     if (homeScore === null) {
       const bodyText = cleanText($('body').text());
       const fallbackScore = bodyText.match(
-        new RegExp(`${homeSlug.replace(/_+/g, '\\s+')}.*?\\b(\\d{1,2})\\s*[-:]\\s*(\\d{1,2})\\b.*?${awaySlug.replace(/_+/g, '\\s+')}`, 'i')
+        new RegExp(`${homeSlug.replace(/_+/g, '\\s+')}.*?\\b(\\d{1,2})\\s*[-:]\\s*(\d{1,2})\\b.*?${awaySlug.replace(/_+/g, '\\s+')}`, 'i')
       );
       if (fallbackScore) {
         homeScore = parseInt(fallbackScore[1], 10);
@@ -86,71 +85,90 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 3. Parse Statistik dari kontainer #stats
+    // 3. Statistik Pertandingan dari #matchstats li (span.left, span.center, span.right)
     const statistics = [];
-    const statsContainer = $('#stats').length ? $('#stats') : $('body');
-    statsContainer.find('tr, .stat-row, .stats-row, .progress-item, .row').each((_, el) => {
-      const row = $(el);
-      if (row.find('tr, .stat-row').length > 1) return;
+    $('#matchstats li, #stats li').each((_, el) => {
+      const li = $(el);
+      const homeVal = cleanText(li.find('.left').first().text());
+      const label = cleanText(li.find('.center').first().text());
+      const awayVal = cleanText(li.find('.right').first().text());
 
-      const cols = row.find('td');
-      if (cols.length === 3) {
-        const homeVal = cleanText($(cols[0]).text());
-        const label = cleanText($(cols[1]).text());
-        const awayVal = cleanText($(cols[2]).text());
-        if (label && /\d/.test(homeVal) && /\d/.test(awayVal)) {
-          statistics.push({ label, home: homeVal, away: awayVal });
-        }
-        return;
-      }
-
-      const leafTexts = [];
-      row.find('span, p, div, strong, b').each((__, node) => {
-        if ($(node).children().length === 0) {
-          const t = cleanText($(node).text());
-          if (t) leafTexts.push(t);
-        }
-      });
-
-      if (leafTexts.length === 3 && /\d/.test(leafTexts[0]) && /\d/.test(leafTexts[2]) && /[a-zA-Z]{3,}/.test(leafTexts[1])) {
-        if (!statistics.some((s) => s.label === leafTexts[1])) {
-          statistics.push({ label: leafTexts[1], home: leafTexts[0], away: leafTexts[2] });
+      if (label && homeVal !== '' && awayVal !== '') {
+        if (!statistics.some((s) => s.label === label)) {
+          statistics.push({
+            label,
+            home: homeVal,
+            away: awayVal
+          });
         }
       }
     });
 
-    // 4. Parse Kejadian Pertandingan (Gol, Kartu, Pergantian)
+    // 4. Kejadian Pertandingan dari #matchtimeline, #live_timeline, dan #summary
     const events = [];
-    $('tr, li, .event-item, .timeline-item, .row').each((_, el) => {
+    const seenEvents = new Set();
+
+    $('#matchtimeline li, #live_timeline li, #summary li, #matchtimeline tr, #summary tr').each((_, el) => {
       const row = $(el);
-      if (row.closest('header, nav, footer, #stats').length > 0) return;
-      if (row.find('tr, li').length > 1) return;
+      const fullText = cleanText(row.text());
+      if (!fullText || fullText.length > 180) return;
 
-      const text = cleanText(row.text());
-      if (text.length > 160) return;
-
-      const minMatch = text.match(/\b(\d{1,3}(?:\+\d+)?')\b/);
+      // Mendukung format menit '45 atau 45' (termasuk tambahan waktu '90+2)
+      const minMatch = fullText.match(/(?:'(\d{1,3}(?:\+\d+)?)|(\d{1,3}(?:\+\d+)?)')/);
       if (!minMatch) return;
 
-      const htmlLower = (row.html() || '').toLowerCase();
-      let type = 'EVENT';
-      if (htmlLower.includes('goal') || htmlLower.includes('ball') || htmlLower.includes('gol')) type = 'GOAL';
-      else if (htmlLower.includes('yellow') || htmlLower.includes('kuning')) type = 'YELLOW_CARD';
-      else if (htmlLower.includes('red') || htmlLower.includes('merah')) type = 'RED_CARD';
-      else if (htmlLower.includes('sub') || htmlLower.includes('exchange') || htmlLower.includes('ganti')) type = 'SUBSTITUTION';
+      const minuteNum = minMatch[1] || minMatch[2];
+      const minute = `${minuteNum}'`;
 
-      events.push({
-        minute: minMatch[1],
-        type,
-        detail: text
-      });
+      const leftText = cleanText(row.find('.left, td:first-child').first().text());
+      const rightText = cleanText(row.find('.right, td:last-child').first().text());
+
+      let team = null;
+      let detail = fullText;
+      if (leftText && !rightText) {
+        team = 'home';
+        detail = leftText;
+      } else if (rightText && !leftText) {
+        team = 'away';
+        detail = rightText;
+      } else if (leftText && rightText) {
+        // Jika salah satu sisi berisi menit dan sisi lain berisi nama pemain
+        if (leftText.includes(minuteNum)) {
+          team = 'away';
+          detail = rightText;
+        } else {
+          team = 'home';
+          detail = leftText;
+        }
+      }
+
+      const imgSrcs = row
+        .find('img')
+        .map((__, img) => $(img).attr('src') || $(img).attr('alt') || '')
+        .get()
+        .join(' ')
+        .toLowerCase();
+
+      const type = detectEventType((row.html() || '').toLowerCase(), imgSrcs);
+      const cleanDetail = cleanText(detail.replace(/'?\d{1,3}(?:\+\d+)?'?/g, '')) || fullText;
+      const eventKey = `${minute}-${team}-${cleanDetail}`;
+
+      if (!seenEvents.has(eventKey)) {
+        seenEvents.add(eventKey);
+        events.push({
+          minute,
+          team,
+          type,
+          player: cleanDetail
+        });
+      }
     });
 
-    // 5. Parse Susunan Pemain (Lineup) jika tab #lineup tersedia
+    // 5. Susunan Pemain (#lineup)
     const lineups = [];
-    $('#lineup, [id*="lineup" i], [id*="susunan" i]').find('tr, li, .player-item').each((_, el) => {
+    $('#lineup li, #lineup tr').each((_, el) => {
       const text = cleanText($(el).text());
-      if (text && text.length >= 3 && text.length <= 80 && !lineups.includes(text)) {
+      if (text && text.length >= 3 && text.length <= 90 && !lineups.includes(text)) {
         lineups.push(text);
       }
     });
