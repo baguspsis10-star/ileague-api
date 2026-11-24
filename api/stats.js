@@ -2,34 +2,55 @@ const cheerio = require('cheerio');
 const { httpClient } = require('../lib/httpClient');
 const { normalizeUrl, cleanText, handleCors } = require('../lib/helpers');
 
-function parseStatList($, containerSelector) {
-  const list = [];
-  $(containerSelector)
-    .find('tr, .player-item, .stat-row')
-    .each((i, el) => {
-      const row = $(el);
-      const playerName = cleanText(row.find('.player-name, .nama-pemain, td:nth-child(2)').first().text());
-      if (!playerName || playerName.toLowerCase() === 'pemain') return;
+const COMPETITION = 'BRI_SUPER_LEAGUE_2026-27';
 
-      const clubName = cleanText(row.find('.club-name, .team-name, td:nth-child(3)').first().text());
-      const imgs = row.find('img');
-      const playerPhoto = normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'));
+function parseStatTable($, tableEl) {
+  const list = [];
+  $(tableEl)
+    .find('tbody tr')
+    .each((i, el) => {
+      const cols = $(el).find('td');
+      if (cols.length < 3) return;
+
+      const imgs = $(el)
+        .find('img')
+        .filter((_, img) => {
+          const src = $(img).attr('data-src') || $(img).attr('src') || '';
+          return src && !src.includes('flagcdn.com');
+        });
+
+      const texts = [];
+      cols.each((_, col) => {
+        const t = cleanText($(col).text());
+        if (t && !/^\d+$/.test(t) && /[a-zA-Z]{2,}/.test(t)) {
+          texts.push(t);
+        }
+      });
+
+      const player = texts[0] || '';
+      const club = texts[1] || '';
+      if (!player) return;
+
+      const lastColNum = cleanText(cols.last().text()).replace(/\D/g, '');
+      const total = parseInt(lastColNum, 10) || 0;
+
+      const photo = imgs.length > 1
+        ? normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'))
+        : null;
       const clubLogo = imgs.length > 1
         ? normalizeUrl($(imgs[1]).attr('data-src') || $(imgs[1]).attr('src'))
-        : playerPhoto;
-
-      const valueText = cleanText(row.find('.stat-value, .goals, .assists, td:last-child').text()).replace(/\D/g, '');
-      const total = parseInt(valueText, 10) || 0;
+        : normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'));
 
       list.push({
         rank: list.length + 1,
-        player: playerName,
-        photo: imgs.length > 1 ? playerPhoto : null,
-        club: clubName,
+        player,
+        photo,
+        club,
         club_logo: clubLogo,
         total
       });
     });
+
   return list;
 }
 
@@ -37,29 +58,17 @@ module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
   try {
-    let html;
-    try {
-      const response = await httpClient.get('/statistik');
-      html = response.data;
-    } catch {
-      const fallback = await httpClient.get('/');
-      html = fallback.data;
-    }
+    const response = await httpClient.get(`/top_actions/player/${COMPETITION}`);
+    const $ = cheerio.load(response.data || '');
+    const tables = $('table');
 
-    const $ = cheerio.load(html);
-
-    let topScorers = parseStatList($, '#top-scorer, .top-scorers, [data-tab="goals"]');
-    let topAssists = parseStatList($, '#top-assist, .top-assists, [data-tab="assists"]');
-
-    if (topScorers.length === 0 && topAssists.length === 0) {
-      const tables = $('table');
-      if (tables.length >= 1) topScorers = parseStatList($, tables[0]);
-      if (tables.length >= 2) topAssists = parseStatList($, tables[1]);
-    }
+    const topScorers = tables.length >= 1 ? parseStatTable($, tables[0]) : [];
+    const topAssists = tables.length >= 2 ? parseStatTable($, tables[1]) : [];
 
     res.status(200).json({
       success: true,
       source: 'ileague.id',
+      competition: COMPETITION,
       updated_at: new Date().toISOString(),
       data: {
         top_scorers: topScorers,

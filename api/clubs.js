@@ -2,45 +2,45 @@ const cheerio = require('cheerio');
 const { httpClient } = require('../lib/httpClient');
 const { normalizeUrl, cleanText, handleCors, extractMatchId } = require('../lib/helpers');
 
+const COMPETITION = 'BRI_SUPER_LEAGUE_2026-27';
+
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
   try {
-    let html;
-    try {
-      const response = await httpClient.get('/klub');
-      html = response.data;
-    } catch {
-      const fallback = await httpClient.get('/klasemen');
-      html = fallback.data;
-    }
+    const response = await httpClient.get(`/clubs/index/${COMPETITION}`);
+    const $ = cheerio.load(response.data || '');
 
-    const $ = cheerio.load(html);
     const clubs = [];
     const seen = new Set();
 
-    $('.club-card, .team-card, .club-item, table tbody tr').each((i, el) => {
+    $('a[href*="/clubs/detail/"], .club-card, .team-card, table tbody tr').each((_, el) => {
       const item = $(el);
-      const name = cleanText(
-        item.find('.club-name, .team-name, h3, h4, td:nth-child(2)').first().text()
-      );
+      if (item.closest('header, nav, footer').length > 0) return;
 
-      if (!name || seen.has(name.toLowerCase())) return;
+      const link = item.is('a') ? item.attr('href') : item.find('a[href]').first().attr('href');
+      const name = cleanText(
+        item.find('.club-name, .team-name, h3, h4, h5, td:nth-child(2)').first().text()
+      ) || cleanText(item.text());
+
+      if (!name || name.length < 3 || seen.has(name.toLowerCase())) return;
       seen.add(name.toLowerCase());
 
-      const img = item.find('img').first();
+      const img = item
+        .find('img')
+        .filter((__, im) => {
+          const src = $(im).attr('data-src') || $(im).attr('src') || '';
+          return src && !src.includes('flagcdn.com');
+        })
+        .first();
+
       const logo = normalizeUrl(img.attr('data-src') || img.attr('src'));
-      const link = item.find('a').attr('href');
       const slug = extractMatchId(link) || name.toLowerCase().replace(/[^a-z0-9]+/g, '-');
-      const stadium = cleanText(item.find('.stadium, .venue, .stadion').text()) || null;
-      const city = cleanText(item.find('.city, .kota').text()) || null;
 
       clubs.push({
         id: slug,
         name,
         logo,
-        stadium,
-        city,
         profile_url: link ? normalizeUrl(link) : null
       });
     });
@@ -48,6 +48,7 @@ module.exports = async (req, res) => {
     res.status(200).json({
       success: true,
       source: 'ileague.id',
+      competition: COMPETITION,
       updated_at: new Date().toISOString(),
       total: clubs.length,
       data: clubs
