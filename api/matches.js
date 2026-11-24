@@ -60,8 +60,11 @@ module.exports = async (req, res) => {
       const awayLogo = normalizeUrl($(imgs[1]).attr('data-src') || $(imgs[1]).attr('src'));
 
       const fullText = cleanText(linkEl.text());
+      const rawHtml = linkEl.html() || '';
       const scoreMatch = fullText.match(/\b(\d{1,2})\s*[-:]\s*(\d{1,2})\b/);
-      const timeMatch = fullText.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/);
+      const timeMatch =
+        fullText.match(/\b([01]?\d|2[0-3]):([0-5]\d)\b/) ||
+        rawHtml.match(/(?:title|data-time|kickoff)=["'][^"']*?([01]?\d|2[0-3]):([0-5]\d)/i);
 
       const isLive = /\b(LIVE|HT|BERLANGSUNG|\d{1,3}')\b/i.test(fullText);
       const isFinished = /\b(FT|SELESAI|FULL TIME)\b/i.test(fullText);
@@ -73,10 +76,17 @@ module.exports = async (req, res) => {
         status = 'FINISHED';
       }
 
+      const kickoffTime = timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : null;
+      const displayTime =
+        status === 'FINISHED'
+          ? 'FT'
+          : status === 'LIVE'
+            ? 'LIVE'
+            : kickoffTime || 'TBD';
+
       const homeName = formatSlugName(homeSlug) || cleanText($(imgs[0]).attr('alt'));
       const awayName = formatSlugName(awaySlug) || cleanText($(imgs[1]).attr('alt'));
 
-      // Ekstrak nama stadion dari teks setelah nama tim tamu
       let venue = null;
       if (awayName) {
         const afterAwayRegex = new RegExp(`${escapeRegExp(awayName)}\\s+(.+)$`, 'i');
@@ -92,7 +102,8 @@ module.exports = async (req, res) => {
         matchweek: selectedWeek ? `Pekan ${selectedWeek}` : null,
         week_number: selectedWeek ? parseInt(selectedWeek, 10) : null,
         date: dateFromUrl,
-        time: timeMatch ? `${timeMatch[1]}:${timeMatch[2]}` : null,
+        time: kickoffTime,
+        display_time: displayTime,
         venue,
         home: {
           name: homeName,
