@@ -1,354 +1,239 @@
-// MATCHES & MATCH CARDS MODULE - MODERN OBSIDIAN MATTE CARDS + SKELETON LOADING
+const axios = require('axios');
+const cheerio = require('cheerio');
 
-// Check if Match is Favorited
-function isFavorite(eventId) {
-  return favoriteMatches.some(id => String(id) === String(eventId));
+const BASE_URL = 'https://ileague.id';
+const COMPETITION = 'BRI_SUPER_LEAGUE_2026-27';
+
+function cleanText(str) {
+  return String(str || '').replace(/\s+/g, ' ').trim();
 }
 
-// Toggle Favorite State for a Match
-function toggleFavorite(eventId, e) {
-  if (e) e.stopPropagation();
-  const idStr = String(eventId);
-  if (isFavorite(idStr)) {
-    favoriteMatches = favoriteMatches.filter(id => String(id) !== idStr);
-  } else {
-    favoriteMatches.push(idStr);
+function normalizeUrl(url) {
+  if (!url) return null;
+  const trimmed = String(url).trim();
+  if (trimmed.startsWith('http://') || trimmed.startsWith('https://')) return trimmed;
+  if (trimmed.startsWith('//')) return `https:${trimmed}`;
+  return `${BASE_URL}${trimmed.startsWith('/') ? '' : '/'}${trimmed}`;
+}
+
+function extractMatchId(href) {
+  if (!href) return null;
+  const cleanHref = String(href).split('#')[0].split('?')[0];
+  const idx = cleanHref.indexOf(`${COMPETITION}/`);
+  if (idx !== -1) {
+    return cleanHref.slice(idx + COMPETITION.length + 1).replace(/^\/+|\/+$/g, '');
   }
-  localStorage.setItem('bgs_favorites', JSON.stringify(favoriteMatches));
-  loadData(true);
+  return null;
 }
 
-// Sort Events Prioritizing Favorite Teams, Favorite Matches, and Date
-function sortEventsByFavoriteAndDate(events) {
-  return events.sort((a, b) => {
-    const compA = a.competitions?.[0];
-    const compB = b.competitions?.[0];
-
-    const aHasFavTeam = compA?.competitors?.some(c => isTeamFavorite(c.team?.id)) ? 1 : 0;
-    const bHasFavTeam = compB?.competitors?.some(c => isTeamFavorite(c.team?.id)) ? 1 : 0;
-
-    if (bHasFavTeam !== aHasFavTeam) return bHasFavTeam - aHasFavTeam;
-
-    const aFavMatch = isFavorite(a.id) ? 1 : 0;
-    const bFavMatch = isFavorite(b.id) ? 1 : 0;
-    if (bFavMatch !== aFavMatch) return bFavMatch - aFavMatch;
-
-    return new Date(a.date) - new Date(b.date);
+async function fetchHtml(path) {
+  const res = await axios.get(`${BASE_URL}${path}`, {
+    timeout: 7500,
+    headers: {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/126.0.0.0 Safari/537.36',
+      Accept: 'text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8',
+      Referer: BASE_URL
+    }
   });
+  return res.data || '';
 }
 
-// Monitor Live Favorite Events to Trigger Sounds and Push Notifications
-function monitorLiveFavoriteEvents(event) {
-  const eventId = String(event.id);
-  const comp = event.competitions?.[0];
-  if (!comp) return;
+function parseFixturesHtml(html, fallbackWeek = null) {
+  const $ = cheerio.load(html || '');
+  const matches = [];
+  const seen = new Set();
 
-  const home = comp.competitors?.find(c => c.homeAway === 'home');
-  const away = comp.competitors?.find(c => c.homeAway === 'away');
+  let detectedWeek = fallbackWeek;
+  const weekHeading = cleanText($('h1, h2, h3, .week-title, .active, select option[selected]').text());
+  const weekMatch = weekHeading.match(/Pekan\s*(\d+)/i);
+  if (weekMatch) {
+    detectedWeek = parseInt(weekMatch[1], 10);
+  }
 
-  const isFavTeamMatch = isTeamFavorite(home?.team?.id) || isTeamFavorite(away?.team?.id);
-  const isFavMatch = isFavorite(eventId);
+  let currentDate = '';
 
-  if (!isFavTeamMatch && !isFavMatch) return;
+  $('tr, .match-item, .fixture-item, .schedule-item, .card, li').each((_, el) => {
+    const row = $(el);
+    if (row.closest('header, nav, footer').length > 0) return;
 
-  const matchName = `${home?.team?.shortDisplayName || 'Home'} vs ${away?.team?.shortDisplayName || 'Away'}`;
-  const homeScore = parseInt(home?.score || '0');
-  const awayScore = parseInt(away?.score || '0');
-  const totalScore = homeScore + awayScore;
+    const rowText = cleanText(row.text());
 
-  const state = event.status?.type?.state; 
-  const period = event.status?.period || 0;
-  const detailStr = (event.status?.type?.shortDetail || event.status?.type?.description || '').toLowerCase();
+    if (
+      rowText.length < 45 &&
+      /\d{1,2}\s+(?:Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember)\s+\d{4}/i.test(rowText) &&
+      !row.find('a[href*="/result/detail/"], a[href*="/fixtures/detail/"]').length
+    ) {
+      currentDate = rowText;
+      return;
+    }
 
-  const hasLineup = Boolean(comp.rostersAvailable || (event.rosters && event.rosters.length >= 2));
+    const detailLink = row
+      .find('a[href*="/result/detail/"], a[href*="/fixtures/detail/"], a[href*="/match/"]')
+      .first();
 
-  let corners = 0, yellows = 0, reds = 0;
-  [home, away].forEach(team => {
-    if (team?.statistics) {
-      team.statistics.forEach(s => {
-        const name = (s.name || s.label || '').toLowerCase();
-        if (name.includes('corner')) corners += parseInt(s.displayValue || s.value || 0);
-        if (name.includes('yellowcard')) yellows += parseInt(s.displayValue || s.value || 0);
-        if (name.includes('redcard')) reds += parseInt(s.displayValue || s.value || 0);
+    const imgs = row.find('img').filter((__, img) => {
+      const src = $(img).attr('data-src') || $(img).attr('src') || '';
+      return src.includes('/uploads/images/logo/') && !src.includes('competition-logo');
+    });
+
+    if (!detailLink.length && imgs.length < 2) return;
+    if (row.find('tr, .match-item, .fixture-item').length > 1) return;
+
+    const href = detailLink.attr('href') || '';
+    const matchId = extractMatchId(href);
+    const idParts = (matchId || '').split('/');
+    const dateFromId =
+      idParts.length >= 3 && /^\d{4}-\d{2}-\d{2}$/.test(idParts[0]) ? idParts[0] : '';
+
+    const teamTexts = [];
+    row.find('td, span, p, div, h4, h5, strong, a').each((__, node) => {
+      if ($(node).children().length === 0) {
+        const t = cleanText($(node).text());
+        if (
+          t &&
+          t.length >= 3 &&
+          /[a-zA-Z]{3,}/.test(t) &&
+          !/^(FT|HT|LIVE|VS|WIB|WITA|WIT|DETAIL|STATISTIK|PEKAN)$/i.test(t) &&
+          !/^\d{1,2}[:.]\d{2}/.test(t) &&
+          !/^(Senin|Selasa|Rabu|Kamis|Jumat|Sabtu|Minggu),/i.test(t) &&
+          !teamTexts.includes(t)
+        ) {
+          teamTexts.push(t);
+        }
+      }
+    });
+
+    const homeName =
+      teamTexts[0] || (idParts[1] ? idParts[1].replace(/_+/g, ' ').trim() : '');
+    const awayName =
+      teamTexts[1] || (idParts[2] ? idParts[2].replace(/_+/g, ' ').trim() : '');
+
+    if (!homeName || !awayName || homeName === awayName) return;
+
+    const uniqueKey = matchId || `${dateFromId || currentDate}-${homeName}-${awayName}`;
+    if (seen.has(uniqueKey)) return;
+    seen.add(uniqueKey);
+
+    const homeLogo = imgs[0]
+      ? normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'))
+      : null;
+    const awayLogo = imgs[1]
+      ? normalizeUrl($(imgs[1]).attr('data-src') || $(imgs[1]).attr('src'))
+      : null;
+
+    const scoreMatch = rowText.match(/\b(\d{1,2})\s*[-:]\s*(\d{1,2})\b/);
+    const timeMatch = rowText.match(/\b(\d{1,2}:\d{2})\b/);
+
+    let status = 'upcoming';
+    let homeScore = null;
+    let awayScore = null;
+
+    if (/\bLIVE\b/i.test(rowText)) {
+      status = 'live';
+      if (scoreMatch) {
+        homeScore = parseInt(scoreMatch[1], 10);
+        awayScore = parseInt(scoreMatch[2], 10);
+      }
+    } else if (
+      scoreMatch &&
+      (href.includes('/result/detail/') || /\bFT\b/i.test(rowText) || !timeMatch)
+    ) {
+      status = 'finished';
+      homeScore = parseInt(scoreMatch[1], 10);
+      awayScore = parseInt(scoreMatch[2], 10);
+    }
+
+    matches.push({
+      id: matchId || uniqueKey,
+      week: detectedWeek,
+      date: dateFromId || currentDate || null,
+      time: timeMatch ? timeMatch[1] : null,
+      status,
+      home: {
+        name: homeName,
+        logo: homeLogo,
+        score: homeScore
+      },
+      away: {
+        name: awayName,
+        logo: awayLogo,
+        score: awayScore
+      },
+      detail_url: href ? normalizeUrl(href) : null
+    });
+  });
+
+  return { matches, detectedWeek };
+}
+
+module.exports = async (req, res) => {
+  res.setHeader('Access-Control-Allow-Origin', '*');
+  res.setHeader('Access-Control-Allow-Methods', 'GET,OPTIONS');
+  res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+  if (req.method === 'OPTIONS') return res.status(200).end();
+
+  try {
+    const { week, status } = req.query || {};
+
+    if (week) {
+      const weekNum = parseInt(week, 10);
+      const html = await fetchHtml(`/fixtures/index/${COMPETITION}/${weekNum}/0`);
+      const parsed = parseFixturesHtml(html, weekNum);
+      const filtered = status
+        ? parsed.matches.filter((m) => m.status === String(status).toLowerCase())
+        : parsed.matches;
+
+      return res.status(200).json({
+        success: true,
+        source: 'ileague.id',
+        competition: COMPETITION,
+        week: parsed.detectedWeek || weekNum,
+        updated_at: new Date().toISOString(),
+        total: filtered.length,
+        data: filtered
       });
     }
-  });
 
-  const prev = matchStateCache[eventId];
+    // Ambil pekan aktif dan pekan 10 secara paralel agar cepat dan tidak timeout
+    const [currentResult, prevResult] = await Promise.allSettled([
+      fetchHtml(`/fixtures/index/${COMPETITION}`),
+      fetchHtml(`/fixtures/index/${COMPETITION}/10/0`)
+    ]);
 
-  if (prev) {
-    if (totalScore > prev.totalScore) {
-      recentGoalCache[eventId] = Date.now();
-      if (soundSettings.goal) {
-        playEventSound('goal');
-        sendPushNotification(`⚽ GOL! (${matchName})`, `Skor saat ini: ${homeScore} - ${awayScore}`);
-      }
-    }
+    const currentParsed =
+      currentResult.status === 'fulfilled'
+        ? parseFixturesHtml(currentResult.value)
+        : { matches: [], detectedWeek: 11 };
 
-    if (!prev.hasLineup && hasLineup) {
-      if (soundSettings.lineup) {
-        sendPushNotification(`📋 Lineup Dirilis!`, `Susunan pemain untuk ${matchName} sudah dirilis.`);
-      }
-    }
+    const prevParsed =
+      prevResult.status === 'fulfilled'
+        ? parseFixturesHtml(prevResult.value, 10)
+        : { matches: [], detectedWeek: 10 };
 
-    if (prev.state === 'pre' && state === 'in' && period === 1) {
-      if (soundSettings.kickoff1) {
-        playEventSound('kickoff1');
-        sendPushNotification(`🏁 Kick-off Babak 1`, `Pertandingan ${matchName} telah dimulai!`);
-      }
-    }
+    const mergedMap = new Map();
+    [...prevParsed.matches, ...currentParsed.matches].forEach((m) => {
+      if (m && m.id) mergedMap.set(m.id, m);
+    });
 
-    if (prev.period === 1 && (detailStr.includes('ht') || detailStr.includes('half')) && !prev.isHT) {
-      if (soundSettings.halftime) {
-        playEventSound('halftime');
-        sendPushNotification(`⏸ Babak 1 Selesai (HT)`, `Skor babak pertama ${matchName}: ${homeScore} - ${awayScore}`);
-      }
-    }
+    const allMatches = Array.from(mergedMap.values());
+    const filtered = status
+      ? allMatches.filter((m) => m.status === String(status).toLowerCase())
+      : allMatches;
 
-    if (prev.isHT && state === 'in' && period === 2) {
-      if (soundSettings.kickoff2) {
-        playEventSound('kickoff2');
-        sendPushNotification(`▶ Kick-off Babak 2`, `Babak kedua ${matchName} telah dimulai!`);
-      }
-    }
-
-    if (prev.state === 'in' && state === 'post') {
-      if (soundSettings.fulltime) {
-        playEventSound('fulltime');
-        sendPushNotification(`🔚 Pertandingan Selesai (FT)`, `Hasil akhir ${matchName}: ${homeScore} - ${awayScore}`);
-      }
-    }
-
-    if (corners > prev.corners) {
-      if (soundSettings.corner) {
-        playEventSound('corner');
-        sendPushNotification(`🚩 Tendangan Sudut (Corner)`, `Terjadi corner pada laga ${matchName}`);
-      }
-    }
-
-    if (yellows > prev.yellows) {
-      if (soundSettings.yellow) {
-        playEventSound('yellow');
-        sendPushNotification(`🟨 Kartu Kuning`, `Kartu kuning diberikan pada laga ${matchName}`);
-      }
-    }
-
-    if (reds > prev.reds) {
-      if (soundSettings.red) {
-        playEventSound('red');
-        sendPushNotification(`🟥 Kartu Merah`, `Kartu merah dikeluarkan pada laga ${matchName}`);
-      }
-    }
+    return res.status(200).json({
+      success: true,
+      source: 'ileague.id',
+      competition: COMPETITION,
+      week: currentParsed.detectedWeek || 11,
+      updated_at: new Date().toISOString(),
+      total: filtered.length,
+      data: filtered
+    });
+  } catch (error) {
+    return res.status(500).json({
+      success: false,
+      message: 'Gagal mengambil jadwal pertandingan dari ileague.id',
+      error: error.message
+    });
   }
-
-  matchStateCache[eventId] = { 
-    state, period, isHT: detailStr.includes('ht') || detailStr.includes('half'), homeScore, awayScore, totalScore, corners, yellows, reds, hasLineup 
-  };
-}
-
-// Skeleton Loading untuk Kartu Pertandingan
-function renderMatchesSkeleton(targetContainerId, count = 4) {
-  const container = document.getElementById(targetContainerId);
-  if (!container) return;
-
-  const skeletonCard = `
-    <div class="p-3.5 rounded-2xl bg-[#131822] border border-white/[0.07] animate-pulse">
-      <div class="flex items-center justify-between mb-3">
-        <div class="h-4 w-28 bg-white/[0.06] rounded-md"></div>
-        <div class="flex items-center gap-1.5">
-          <div class="h-4 w-4 bg-white/[0.06] rounded-md"></div>
-          <div class="h-4 w-4 bg-white/[0.06] rounded-md"></div>
-          <div class="h-4 w-12 bg-white/[0.06] rounded-md"></div>
-        </div>
-      </div>
-
-      <div class="flex items-center justify-between gap-2 pt-0.5">
-        <div class="flex flex-col items-center gap-2 w-[35%]">
-          <div class="w-12 h-12 sm:w-[52px] sm:h-[52px] rounded-full bg-white/[0.06]"></div>
-          <div class="h-3 w-16 bg-white/[0.06] rounded"></div>
-        </div>
-
-        <div class="w-[30%] flex flex-col items-center">
-          <div class="h-7 w-14 rounded-lg bg-white/[0.08]"></div>
-          <div class="h-2.5 w-20 rounded bg-white/[0.05] mt-2"></div>
-        </div>
-
-        <div class="flex flex-col items-center gap-2 w-[35%]">
-          <div class="w-12 h-12 sm:w-[52px] sm:h-[52px] rounded-full bg-white/[0.06]"></div>
-          <div class="h-3 w-16 bg-white/[0.06] rounded"></div>
-        </div>
-      </div>
-    </div>
-  `;
-
-  container.innerHTML = Array(count).fill(skeletonCard).join('');
-}
-
-// Render Match Cards dengan Nama Klub di Bawah Logo
-function renderMatchesCards(targetContainerId, events, showLeagueBadge = false, customVariant = null) {
-  const container = document.getElementById(targetContainerId);
-  if (!container) return;
-  container.innerHTML = '';
-
-  if (events.length === 0) {
-    container.innerHTML = `
-      <div class="text-center py-8 text-slate-400 border border-white/[0.07] rounded-2xl bg-[#131822] text-xs">
-        Tidak ada pertandingan.
-      </div>
-    `;
-    return;
-  }
-
-  const sortedEvents = sortEventsByFavoriteAndDate([...events]);
-
-  sortedEvents.forEach(event => {
-    const comp = event.competitions[0];
-    const home = comp.competitors.find(c => c.homeAway === 'home');
-    const away = comp.competitors.find(c => c.homeAway === 'away');
-    
-    const homeLogo = getTeamLogo(home?.team) || PLAIN_SHIELD_LOGO;
-    const awayLogo = getTeamLogo(away?.team) || PLAIN_SHIELD_LOGO;
-
-    const homeFav = isTeamFavorite(home?.team?.id);
-    const awayFav = isTeamFavorite(away?.team?.id);
-    const hasFavTeam = homeFav || awayFav;
-
-    const state = event.status.type.state; 
-    const isPre = state === 'pre';
-    const isLive = state === 'in';
-    const liveMinuteText = event.status?.type?.shortDetail || 'LIVE';
-    
-    const formattedTime = formatLocalDate(event.date);
-    const favorited = isFavorite(event.id);
-
-    const eventIdStr = String(event.id);
-    const hasRecentGoal = recentGoalCache[eventIdStr] && ((Date.now() - recentGoalCache[eventIdStr]) < 30000);
-
-    let scoreDisplay = isPre 
-      ? `<span class="text-[11px] font-extrabold tracking-widest text-slate-300 bg-white/[0.06] px-3 py-1 rounded-full border border-white/10">VS</span>`
-      : `<span class="text-sm sm:text-base font-black tracking-tight tabular-nums ${hasRecentGoal ? 'goal-active-pulse px-2.5 py-0.5 rounded-lg' : 'text-white bg-white/[0.07] px-3 py-1 rounded-lg border border-white/10'} whitespace-nowrap">${home?.score ?? '0'} - ${away?.score ?? '0'}</span>`;
-
-    let cardStyleClass = 'card-upcoming';
-
-    if (customVariant === 'finished-fav') {
-      cardStyleClass = 'card-fav-finished';
-    } else if (customVariant === 'upcoming-fav' || ((hasFavTeam || favorited) && isPre)) {
-      cardStyleClass = 'card-fav-upcoming';
-    } else if (isLive) {
-      cardStyleClass = 'card-live';
-    } else if (isPre) {
-      cardStyleClass = 'card-upcoming';
-    } else {
-      cardStyleClass = 'card-finished';
-    }
-
-    const foundLeague = typeof LEAGUES !== 'undefined' ? LEAGUES.find(l => l.id === event.leagueId) : null;
-    const rawLeagueLogo = event.leagueLogo || foundLeague?.logo || '';
-    const fallbackLeagueBadge = generateUnlicensedLeagueBadge(event.leagueId || 'generic', event.leagueName || '', '');
-    const finalLeagueLogoSrc = rawLeagueLogo || fallbackLeagueBadge;
-
-    const card = document.createElement('div');
-    card.className = `p-3.5 rounded-2xl transition-all duration-150 cursor-pointer relative ${cardStyleClass}`;
-    
-    card.onclick = (e) => {
-      e.stopPropagation();
-      openMatchDetail(event.leagueId || 'idn.1', event.id, event.leagueName || 'Detail');
-    };
-
-    card.innerHTML = `
-      <!-- TOP BADGE BAR -->
-      <div class="flex items-center justify-between text-[11px] text-slate-400 mb-3 gap-2">
-        <div class="flex items-center gap-1.5 flex-1 min-w-0">
-          ${hasFavTeam ? '<span class="text-[8.5px] bg-amber-500/15 text-amber-300 border border-amber-500/30 px-2 py-0.5 rounded-full font-extrabold tracking-wider shrink-0 flex items-center gap-1"><i class="fa-solid fa-star text-[7px] text-amber-400"></i>FAVORIT</span>' : ''}
-          ${showLeagueBadge ? `
-            <span class="text-[10px] bg-white/[0.05] border border-white/[0.08] text-slate-300 px-2 py-0.5 rounded-md truncate max-w-[185px] font-semibold flex items-center gap-1.5">
-              <img src="${finalLeagueLogoSrc}" loading="lazy" class="w-4 h-4 object-contain shrink-0" alt="" onerror="this.onerror=null; this.src='${fallbackLeagueBadge}';">
-              <span class="truncate">${event.leagueFlag ? event.leagueFlag + ' ' : ''}${event.leagueName || ''}</span>
-            </span>` : ''}
-        </div>
-        <div class="flex items-center gap-1.5 shrink-0">
-          <button onclick="shareMatchCard('${event.id}', '${(home?.team?.displayName||'Home').replace(/'/g, "\\'")}', '${(away?.team?.displayName||'Away').replace(/'/g, "\\'")}', '${isPre ? formattedTime : (home?.score ?? '0') + ' - ' + (away?.score ?? '0')}', '${(event.leagueName||'').replace(/'/g, "\\'")}', event)" class="p-1 hover:scale-110 transition text-xs text-slate-400 hover:text-emerald-400" title="Bagikan Skor">
-            <i class="fa-solid fa-share-nodes"></i>
-          </button>
-          <button onclick="toggleFavorite('${event.id}', event)" class="p-1 hover:scale-110 transition text-xs" title="Favorit">
-            <i class="${favorited ? 'fa-solid fa-star text-amber-400' : 'fa-regular fa-star text-slate-400 hover:text-amber-400'}"></i>
-          </button>
-          <span class="text-[9.5px] bg-white/[0.05] hover:bg-white/[0.1] border border-white/[0.08] px-2 py-0.5 rounded-lg text-slate-300 font-semibold flex items-center gap-1 transition">Detail <i class="fa-solid fa-chevron-right text-[7px] text-slate-500"></i></span>
-        </div>
-      </div>
-
-      <!-- MAIN TEAMS (LOGO ATAS, NAMA BAWAH) & SCORE BLOCK -->
-      <div class="flex items-center justify-between gap-2 pt-0.5">
-        <!-- HOME TEAM -->
-        <div class="flex flex-col items-center justify-center gap-1.5 w-[35%] min-w-0 text-center">
-          <img src="${homeLogo}" loading="lazy" class="w-12 h-12 sm:w-[52px] sm:h-[52px] object-contain shrink-0" alt="" onerror="this.onerror=null; this.src='${PLAIN_SHIELD_LOGO}';">
-          <span class="font-bold text-[11px] sm:text-xs leading-tight text-slate-100 line-clamp-2 w-full">
-            ${home?.team?.shortDisplayName || home?.team?.displayName || ''}${homeFav ? ' <i class="fa-solid fa-star text-amber-400 text-[8px] align-middle"></i>' : ''}
-          </span>
-        </div>
-
-        <!-- SCORE / VS & STATUS -->
-        <div class="w-[30%] shrink-0 flex flex-col items-center justify-center text-center">
-          ${scoreDisplay}
-          <span class="mt-2 text-[9.5px] font-medium text-slate-400 flex items-center justify-center gap-1 whitespace-nowrap tabular-nums">
-            <i class="fa-regular fa-clock text-[9px] text-slate-500 shrink-0"></i>
-            <span class="${isLive ? 'text-rose-400 font-bold' : 'text-slate-400'}">${isLive ? liveMinuteText : formattedTime}</span>
-          </span>
-        </div>
-
-        <!-- AWAY TEAM -->
-        <div class="flex flex-col items-center justify-center gap-1.5 w-[35%] min-w-0 text-center">
-          <img src="${awayLogo}" loading="lazy" class="w-12 h-12 sm:w-[52px] sm:h-[52px] object-contain shrink-0" alt="" onerror="this.onerror=null; this.src='${PLAIN_SHIELD_LOGO}';">
-          <span class="font-bold text-[11px] sm:text-xs leading-tight text-slate-100 line-clamp-2 w-full">
-            ${away?.team?.shortDisplayName || away?.team?.displayName || ''}${awayFav ? ' <i class="fa-solid fa-star text-amber-400 text-[8px] align-middle"></i>' : ''}
-          </span>
-        </div>
-      </div>
-    `;
-    container.appendChild(card);
-  });
-}
-
-// Fitur Bagikan Kartu Skor (Web Share API + Fallback Salin Clipboard)
-async function shareMatchCard(eventId, homeName, awayName, scoreOrTime, leagueName, e) {
-  if (e) e.stopPropagation();
-  
-  const textContent = `⚽ ${leagueName ? leagueName + ': ' : ''}${homeName} ${scoreOrTime} ${awayName}\n\nPantau live score & statistik lengkap di BGS ScoreHub!`;
-
-  if (navigator.share) {
-    try {
-      await navigator.share({
-        title: `BGS ScoreHub — ${homeName} vs ${awayName}`,
-        text: textContent,
-        url: window.location.href
-      });
-    } catch (err) {
-      if (err.name !== 'AbortError') copyToClipboard(textContent);
-    }
-  } else {
-    copyToClipboard(textContent);
-  }
-}
-
-function copyToClipboard(text) {
-  navigator.clipboard.writeText(text).then(() => {
-    showToast('Teks skor berhasil disalin!');
-  }).catch(() => {
-    showToast('Gagal menyalin teks skor.');
-  });
-}
-
-function showToast(message) {
-  let toast = document.getElementById('bgs-toast');
-  if (!toast) {
-    toast = document.createElement('div');
-    toast.id = 'bgs-toast';
-    toast.className = 'fixed bottom-20 left-1/2 -translate-x-1/2 z-50 bg-emerald-600 text-white font-bold text-xs px-4 py-2 rounded-full shadow-2xl transition-all duration-300 opacity-0 pointer-events-none flex items-center gap-2';
-    document.body.appendChild(toast);
-  }
-  toast.innerHTML = `<i class="fa-solid fa-circle-check"></i> ${message}`;
-  toast.classList.remove('opacity-0', 'pointer-events-none');
-  setTimeout(() => {
-    toast.classList.add('opacity-0', 'pointer-events-none');
-  }, 2500);
-}
+};
