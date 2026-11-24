@@ -9,6 +9,10 @@ function formatSlugName(slug) {
   return slug.replace(/_+/g, ' ').trim();
 }
 
+function escapeRegExp(str) {
+  return str.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+}
+
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
@@ -22,7 +26,6 @@ module.exports = async (req, res) => {
     const response = await httpClient.get(targetPath);
     const $ = cheerio.load(response.data || '');
 
-    // Deteksi nomor pekan aktif dari dropdown jika parameter ?week tidak diisi
     const selectedWeek =
       week ||
       $('.fixtures-week-picker select option[selected]').attr('value') ||
@@ -38,7 +41,6 @@ module.exports = async (req, res) => {
       if (!href || seen.has(href)) return;
       seen.add(href);
 
-      // Parse informasi dari URL: .../result/detail/BRI_SUPER_LEAGUE_2026-27/2026-11-26/BORNEO_FC_SAMARINDA/PERSITA
       const urlParts = href.replace(/\/$/, '').split('/');
       const detailIdx = urlParts.indexOf('detail');
       const dateFromUrl = detailIdx !== -1 ? urlParts[detailIdx + 2] : null;
@@ -49,7 +51,6 @@ module.exports = async (req, res) => {
           ? urlParts.slice(detailIdx + 2).join('/')
           : `match-${i + 1}`;
 
-      // Ambil logo klub dari tag <img> di dalam baris pertandingan
       const imgs = linkEl.find('img').filter((_, img) => {
         const src = $(img).attr('data-src') || $(img).attr('src') || '';
         return src && !src.includes('flagcdn.com');
@@ -57,15 +58,6 @@ module.exports = async (req, res) => {
 
       const homeLogo = normalizeUrl($(imgs[0]).attr('data-src') || $(imgs[0]).attr('src'));
       const awayLogo = normalizeUrl($(imgs[1]).attr('data-src') || $(imgs[1]).attr('src'));
-
-      // Ambil sel/kolom teks di dalam baris pertandingan
-      const cells = [];
-      linkEl.find('td, div, span').each((_, node) => {
-        if ($(node).children().length === 0) {
-          const t = cleanText($(node).text());
-          if (t) cells.push(t);
-        }
-      });
 
       const fullText = cleanText(linkEl.text());
       const scoreMatch = fullText.match(/\b(\d{1,2})\s*[-:]\s*(\d{1,2})\b/);
@@ -81,19 +73,18 @@ module.exports = async (req, res) => {
         status = 'FINISHED';
       }
 
-      // Nama tim diambil dari teks sel atau fallback dari slug URL
-      const homeName =
-        cells[0] || cleanText($(imgs[0]).attr('alt')) || formatSlugName(homeSlug);
-      const awayName =
-        (cells.length >= 3 ? cells[2] : null) ||
-        cleanText($(imgs[1]).attr('alt')) ||
-        formatSlugName(awaySlug);
+      const homeName = formatSlugName(homeSlug) || cleanText($(imgs[0]).attr('alt'));
+      const awayName = formatSlugName(awaySlug) || cleanText($(imgs[1]).attr('alt'));
 
-      // Stadion biasanya berada di kolom terakhir setelah nama tim tamu
-      const venue =
-        cells.length >= 4
-          ? cells[cells.length - 1]
-          : null;
+      // Ekstrak nama stadion dari teks setelah nama tim tamu
+      let venue = null;
+      if (awayName) {
+        const afterAwayRegex = new RegExp(`${escapeRegExp(awayName)}\\s+(.+)$`, 'i');
+        const venueMatch = fullText.match(afterAwayRegex);
+        if (venueMatch && venueMatch[1]) {
+          venue = cleanText(venueMatch[1]);
+        }
+      }
 
       matches.push({
         id: matchId,
