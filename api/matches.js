@@ -21,7 +21,8 @@ function extractMatchId(href) {
   const cleanHref = String(href).split('#')[0].split('?')[0];
   const idx = cleanHref.indexOf(`${COMPETITION}/`);
   if (idx !== -1) {
-    return cleanHref.slice(idx + COMPETITION.length + 1).replace(/^\/+|\/+$/g, '');
+    const rest = cleanHref.slice(idx + COMPETITION.length + 1).replace(/^\/+|\/+$/g, '');
+    if (rest.split('/').length >= 3) return rest;
   }
   return null;
 }
@@ -39,17 +40,64 @@ async function fetchHtml(path) {
   return res.data || '';
 }
 
-function findMatchCard($, linkEl) {
-  let card = $(linkEl);
+function findMatchCard($, el) {
+  let card = $(el);
   for (let i = 0; i < 6; i++) {
     const parent = card.parent();
     if (!parent.length || parent.is('body, main, section')) break;
-    // Berhenti sebelum naik ke kontainer besar yang memuat lebih dari 1 pertandingan
-    const matchLinksInside = parent.find(`a[href*="/${COMPETITION}/202"]`).length;
-    if (matchLinksInside > 1) break;
+
+    const uniqueIds = new Set();
+    parent.find(`a[href*="/${COMPETITION}/"]`).each((__, a) => {
+      const mId = extractMatchId($(a).attr('href'));
+      if (mId) uniqueIds.add(mId);
+    });
+
+    const logoCount = parent
+      .find('img[src*="/uploads/images/logo/"]')
+      .filter((__, img) => !($(img).attr('src') || '').includes('competition-logo')).length;
+
+    if (uniqueIds.size > 1 || logoCount > 2) break;
     card = parent;
   }
   return card;
+}
+
+function parseScoreAndStatus(cardText, href) {
+  const timeMatch = cardText.match(/\b(\d{1,2}:\d{2})\b/);
+
+  // Hapus format tanggal (2026-11-26) dan jam (15:30) sebelum mencari skor agar tidak muncul angka puluhan
+  const sanitizedText = cardText
+    .replace(/\b\d{4}-\d{2}-\d{2}\b/g, ' ')
+    .replace(/\b\d{1,2}:\d{2}\b/g, ' ');
+
+  const scoreMatch = sanitizedText.match(/\b(\d{1,2})\s*-\s*(\d{1,2})\b/);
+  const isResultUrl = href.includes('/result/');
+  const isFixtureUrl = href.includes('/fixtures/');
+
+  if (/\bLIVE\b/i.test(sanitizedText)) {
+    return {
+      status: 'live',
+      time: timeMatch ? timeMatch[1] : null,
+      homeScore: scoreMatch ? parseInt(scoreMatch[1], 10) : 0,
+      awayScore: scoreMatch ? parseInt(scoreMatch[2], 10) : 0
+    };
+  }
+
+  if (isResultUrl || (scoreMatch && !isFixtureUrl && !timeMatch)) {
+    return {
+      status: 'finished',
+      time: timeMatch ? timeMatch[1] : null,
+      homeScore: scoreMatch ? parseInt(scoreMatch[1], 10) : null,
+      awayScore: scoreMatch ? parseInt(scoreMatch[2], 10) : null
+    };
+  }
+
+  return {
+    status: 'upcoming',
+    time: timeMatch ? timeMatch[1] : null,
+    homeScore: null,
+    awayScore: null
+  };
 }
 
 function parseFixturesHtml(html, weekNum) {
@@ -57,8 +105,11 @@ function parseFixturesHtml(html, weekNum) {
   const matches = [];
   const seen = new Set();
 
-  $(`a[href*="/${COMPETITION}/202"]`).each((_, el) => {
+  // 1. Ekstraksi berbasis tautan detail pertandingan (/result/detail/ atau /fixtures/detail/)
+  $(`a[href*="/${COMPETITION}/"]`).each((_, el) => {
     const href = $(el).attr('href') || '';
+    if (href.includes('/index/') || href.includes('/clubs/')) return;
+
     const matchId = extractMatchId(href);
     if (!matchId || seen.has(matchId)) return;
 
@@ -67,13 +118,12 @@ function parseFixturesHtml(html, weekNum) {
     seen.add(matchId);
 
     const dateStr = parts[0];
-    const homeFromSlug = parts[1].replace(/_+/g, ' ').trim();
-    const awayFromSlug = parts[2].replace(/_+/g, ' ').trim();
+    const homeName = parts[1].replace(/_+/g, ' ').trim();
+    const awayName = parts[2].replace(/_+/g, ' ').trim();
 
     const card = findMatchCard($, el);
     const cardText = cleanText(card.text());
 
-    // Ambil logo klub di dalam kartu pertandingan
     const logos = [];
     card.find('img').each((__, img) => {
       const src = normalizeUrl($(img).attr('data-src') || $(img).attr('src'));
@@ -82,46 +132,113 @@ function parseFixturesHtml(html, weekNum) {
       }
     });
 
-    // Ambil jam kick-off dan skor
-    const timeMatch = cardText.match(/\b(\d{1,2}:\d{2})\b/);
-    const scoreMatch = cardText.match(/\b(\d{1,2})\s*[-:]\s*(\d{1,2})\b/);
-
-    let status = 'upcoming';
-    let homeScore = null;
-    let awayScore = null;
-
-    if (/\bLIVE\b/i.test(cardText)) {
-      status = 'live';
-      if (scoreMatch) {
-        homeScore = parseInt(scoreMatch[1], 10);
-        awayScore = parseInt(scoreMatch[2], 10);
-      }
-    } else if (
-      scoreMatch &&
-      (href.includes('/result/') || /\bFT\b/i.test(cardText) || !timeMatch)
-    ) {
-      status = 'finished';
-      homeScore = parseInt(scoreMatch[1], 10);
-      awayScore = parseInt(scoreMatch[2], 10);
-    }
+    const parsedState = parseScoreAndStatus(cardText, href);
 
     matches.push({
       id: matchId,
       week: weekNum,
       date: dateStr,
-      time: timeMatch ? timeMatch[1] : null,
-      status,
+      time: parsedState.time,
+      status: parsedState.status,
       home: {
-        name: homeFromSlug,
+        name: homeName,
         logo: logos[0] || null,
-        score: homeScore
+        score: parsedState.homeScore
       },
       away: {
-        name: awayFromSlug,
+        name: awayName,
         logo: logos[1] || null,
-        score: awayScore
+        score: parsedState.awayScore
       },
       detail_url: normalizeUrl(href)
+    });
+  });
+
+  // 2. Fallback untuk baris jadwal mendatang yang belum memiliki tautan detail
+  let currentDate = '';
+  $('div, li, tr').each((_, el) => {
+    const row = $(el);
+    if (row.closest('header, nav, footer').length > 0) return;
+
+    const rowText = cleanText(row.text());
+    if (!rowText) return;
+
+    if (
+      rowText.length < 50 &&
+      /\d{1,2}\s+(?:Januari|Februari|Maret|April|Mei|Juni|Juli|Agustus|September|Oktober|November|Desember)\s+\d{4}/i.test(
+        rowText
+      ) &&
+      row.find('img').length === 0
+    ) {
+      currentDate = rowText;
+      return;
+    }
+
+    const logos = [];
+    row.find('img').each((__, img) => {
+      const src = normalizeUrl($(img).attr('data-src') || $(img).attr('src'));
+      if (src && src.includes('/uploads/images/logo/') && !src.includes('competition-logo')) {
+        if (!logos.includes(src)) logos.push(src);
+      }
+    });
+
+    if (logos.length !== 2 || rowText.length > 220) return;
+
+    const teamTexts = [];
+    row.find('span, p, div, h4, h5, strong, a, td').each((__, node) => {
+      if ($(node).children().length === 0) {
+        const t = cleanText($(node).text());
+        if (
+          t &&
+          t.length >= 3 &&
+          /[a-zA-Z]{3,}/.test(t) &&
+          !/^(FT|HT|LIVE|VS|WIB|WITA|WIT|DETAIL|STATISTIK|PEKAN)$/i.test(t) &&
+          !/^\d{1,2}[:.]\d{2}/.test(t) &&
+          !/^(Senin|Selasa|Rabu|Kamis|Jumat|Sabtu|Minggu),/i.test(t) &&
+          !teamTexts.includes(t)
+        ) {
+          teamTexts.push(t);
+        }
+      }
+    });
+
+    if (teamTexts.length < 2) return;
+    const homeName = teamTexts[0];
+    const awayName = teamTexts[1];
+    if (homeName === awayName) return;
+
+    // Cek apakah pertandingan ini sudah tertangkap di langkah 1
+    const alreadyExists = matches.some(
+      (m) =>
+        m.week === weekNum &&
+        m.home.name.toUpperCase() === homeName.toUpperCase() &&
+        m.away.name.toUpperCase() === awayName.toUpperCase()
+    );
+    if (alreadyExists) return;
+
+    const fallbackId = `${currentDate || `week-${weekNum}`}/${homeName.replace(/\s+/g, '_')}/${awayName.replace(/\s+/g, '_')}`;
+    if (seen.has(fallbackId)) return;
+    seen.add(fallbackId);
+
+    const parsedState = parseScoreAndStatus(rowText, '');
+
+    matches.push({
+      id: fallbackId,
+      week: weekNum,
+      date: currentDate || null,
+      time: parsedState.time,
+      status: parsedState.status,
+      home: {
+        name: homeName,
+        logo: logos[0] || null,
+        score: parsedState.homeScore
+      },
+      away: {
+        name: awayName,
+        logo: logos[1] || null,
+        score: parsedState.awayScore
+      },
+      detail_url: null
     });
   });
 
@@ -138,19 +255,22 @@ module.exports = async (req, res) => {
     const { week, status, debug } = req.query || {};
 
     if (debug === '1') {
-      const html = await fetchHtml(`/fixtures/index/${COMPETITION}/10/0`);
-      const $ = cheerio.load(html);
-      const matchLinks = [];
-      $(`a[href*="/${COMPETITION}/202"]`).each((_, el) => {
-        matchLinks.push({
-          href: $(el).attr('href'),
-          text: cleanText($(el).text())
-        });
+      const html11 = await fetchHtml(`/fixtures/index/${COMPETITION}/11/0`);
+      const $ = cheerio.load(html11);
+      const sampleCards = [];
+      $(`a[href*="/${COMPETITION}/"]`).each((_, el) => {
+        const href = $(el).attr('href') || '';
+        if (!href.includes('/index/') && sampleCards.length < 10) {
+          sampleCards.push({
+            href,
+            cardText: cleanText(findMatchCard($, el).text())
+          });
+        }
       });
       return res.status(200).json({
         success: true,
-        totalMatchLinks: matchLinks.length,
-        matchLinks: matchLinks.slice(0, 15)
+        sampleCards,
+        bodySnippet: cleanText($('main, .content, body').first().text()).slice(0, 1200)
       });
     }
 
@@ -173,7 +293,6 @@ module.exports = async (req, res) => {
       });
     }
 
-    // Ambil Pekan 10 (laga selesai) dan Pekan 11 (jadwal aktif) secara paralel
     const [res10, res11] = await Promise.allSettled([
       fetchHtml(`/fixtures/index/${COMPETITION}/10/0`),
       fetchHtml(`/fixtures/index/${COMPETITION}/11/0`)
