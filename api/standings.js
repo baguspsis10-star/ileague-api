@@ -2,54 +2,110 @@ const cheerio = require('cheerio');
 const { httpClient } = require('../lib/httpClient');
 const { normalizeUrl, cleanText, handleCors } = require('../lib/helpers');
 
+const COMPETITION = 'BRI_SUPER_LEAGUE_2026-27';
+
 module.exports = async (req, res) => {
   if (handleCors(req, res)) return;
 
   try {
-    let html;
-    try {
-      const response = await httpClient.get('/klasemen');
-      html = response.data;
-    } catch {
-      const fallback = await httpClient.get('/');
-      html = fallback.data;
+    const { debug } = req.query;
+    const targetPath = `/table/index/${COMPETITION}`;
+
+    const response = await httpClient.get(targetPath);
+    const $ = cheerio.load(response.data || '');
+
+    if (debug === '1') {
+      const sampleRows = [];
+      $('table tr').each((i, row) => {
+        if (i >= 5) return;
+        const cells = [];
+        $(row)
+          .find('th, td')
+          .each((_, cell) => {
+            cells.push({
+              text: cleanText($(cell).text()),
+              img: $(cell).find('img').attr('data-src') || $(cell).find('img').attr('src') || null
+            });
+          });
+        sampleRows.push(cells);
+      });
+      return res.status(200).json({
+        success: true,
+        targetPath,
+        totalTables: $('table').length,
+        sampleRows
+      });
     }
 
-    const $ = cheerio.load(html);
     const standings = [];
 
     $('table tbody tr').each((index, row) => {
       const cols = $(row).find('td');
-      if (cols.length < 8) return;
+      if (cols.length < 6) return;
 
-      const rankText = cleanText($(cols[0]).text()).replace(/\D/g, '');
-      const rank = rankText ? parseInt(rankText, 10) : index + 1;
+      // Cari logo klub di dalam baris
+      const imgEl = $(row)
+        .find('img')
+        .filter((_, img) => {
+          const src = $(img).attr('data-src') || $(img).attr('src') || '';
+          return src && !src.includes('flagcdn.com');
+        })
+        .first();
+      const clubLogo = normalizeUrl(imgEl.attr('data-src') || imgEl.attr('src'));
 
-      const clubCell = $(cols[1]);
-      const clubName = cleanText(clubCell.find('.club-name, .team-name, span, a').first().text()) || cleanText(clubCell.text());
-      const logoImg = clubCell.find('img');
-      const clubLogo = normalizeUrl(logoImg.attr('data-src') || logoImg.attr('src'));
+      // Cari kolom yang berisi nama klub (teks huruf, bukan angka murni atau W/D/L)
+      let clubName = '';
+      let clubColIdx = -1;
+
+      cols.each((colIdx, col) => {
+        if (clubName) return;
+        const txt = cleanText($(col).text());
+        if (
+          txt &&
+          txt.length >= 3 &&
+          /[a-zA-Z]{3,}/.test(txt) &&
+          !/^[WDLMSK\s-]+$/i.test(txt)
+        ) {
+          clubName = txt;
+          clubColIdx = colIdx;
+        }
+      });
 
       if (!clubName) return;
 
-      const played = parseInt(cleanText($(cols[2]).text()), 10) || 0;
-      const win = parseInt(cleanText($(cols[3]).text()), 10) || 0;
-      const draw = parseInt(cleanText($(cols[4]).text()), 10) || 0;
-      const loss = parseInt(cleanText($(cols[5]).text()), 10) || 0;
-      const goalsFor = parseInt(cleanText($(cols[6]).text()), 10) || 0;
-      const goalsAgainst = parseInt(cleanText($(cols[7]).text()), 10) || 0;
+      // Ambil peringkat dari kolom pertama atau fallback ke urutan baris
+      const rankText = cleanText($(cols[0]).text()).replace(/\D/g, '');
+      const rank = rankText ? parseInt(rankText, 10) : index + 1;
 
-      const goalDiff = cols.length >= 10
-        ? parseInt(cleanText($(cols[8]).text()), 10) || (goalsFor - goalsAgainst)
-        : goalsFor - goalsAgainst;
+      // Kumpulkan semua kolom angka setelah kolom nama klub
+      const nums = [];
+      cols.each((colIdx, col) => {
+        if (colIdx <= clubColIdx) return;
+        const raw = cleanText($(col).text());
+        if (/^-?\d+$/.test(raw)) {
+          nums.push(parseInt(raw, 10));
+        }
+      });
 
-      const points = cols.length >= 10
-        ? parseInt(cleanText($(cols[9]).text()), 10) || 0
-        : parseInt(cleanText($(cols[8]).text()), 10) || 0;
+      // Urutan standar kolom klasemen: Main (P), Menang (W), Seri (D), Kalah (L), GM, GK, SG, Poin
+      const played = nums[0] ?? 0;
+      const win = nums[1] ?? 0;
+      const draw = nums[2] ?? 0;
+      const loss = nums[3] ?? 0;
+      const goalsFor = nums.length >= 7 ? nums[4] : 0;
+      const goalsAgainst = nums.length >= 7 ? nums[5] : 0;
+      const goalDiff =
+        nums.length >= 8
+          ? nums[6]
+          : nums.length >= 7
+            ? goalsFor - goalsAgainst
+            : nums[4] ?? 0;
+      const points = nums.length > 0 ? nums[nums.length - 1] : 0;
 
+      // Ambil form 5 pertandingan terakhir (jika tersedia)
       const form = [];
       $(row)
-        .find('.form-badge, .last-match span, td:last-child span')
+        .find('td:last-child span, td:last-child a, td:last-child div, .form-badge')
         .each((_, badge) => {
           const val = cleanText($(badge).text()).toUpperCase();
           if (['W', 'D', 'L', 'M', 'S', 'K'].includes(val)) {
@@ -77,6 +133,7 @@ module.exports = async (req, res) => {
     res.status(200).json({
       success: true,
       source: 'ileague.id',
+      competition: COMPETITION,
       updated_at: new Date().toISOString(),
       total: standings.length,
       data: standings
