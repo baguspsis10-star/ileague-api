@@ -33,116 +33,179 @@ function detectEventType(htmlLower, imgSrcLower, textLower = '') {
   return 'EVENT';
 }
 
-function parsePlayerRow($, el) {
-  const node = $(el);
-  const fullText = cleanText(node.text());
-  if (!fullText || fullText.length < 2 || fullText.length > 100) return null;
+function detectPositionHeader(textLower) {
+  if (/^(penjaga\s*gawang|kiper|goalkeeper)s?$/i.test(textLower)) return 'GK';
+  if (/^(belakang|bek|defender)s?$/i.test(textLower)) return 'DF';
+  if (/^(gelandang|tengah|midfielder)s?$/i.test(textLower)) return 'MF';
+  if (/^(penyerang|depan|forward|striker)s?$/i.test(textLower)) return 'FW';
+  return null;
+}
 
-  const lower = fullText.toLowerCase();
+function isBenchHeader(textLower) {
+  return /^(pemain\s*pengganti|cadangan|substitutes?|bench)$/i.test(textLower);
+}
+
+function isNoiseLineupText(textLower, homeNameLower, awayNameLower) {
+  if (!textLower || textLower.length < 2) return true;
+  if (textLower === 'vs' || textLower === 'v') return true;
   if (
-    lower.includes('starting') ||
-    lower.includes('substitut') ||
-    lower.includes('cadangan') ||
-    lower.includes('pemain inti') ||
-    lower.includes('pengganti') ||
-    lower.includes('lineup') ||
-    lower.includes('line-up') ||
-    lower.includes('coach') ||
-    lower.includes('pelatih')
+    /^(line\s*-?\s*up|starting\s*xi|pemain\s*inti|pelatih|head\s*coach|coach|manager|official)$/i.test(
+      textLower
+    )
   ) {
-    return null;
+    return true;
+  }
+  if (homeNameLower && textLower === homeNameLower) return true;
+  if (awayNameLower && textLower === awayNameLower) return true;
+  return false;
+}
+
+function cleanPlayerNameAndNumber(rawText) {
+  let text = cleanText(rawText);
+  if (!text) return null;
+
+  // Ekstrak nomor punggung di awal (contoh: "14 '90TEJA PAKU ALAM" atau "#14 TEJA")
+  let number = '';
+  const numMatch = text.match(/^#?(\d{1,2})\b\s*(.*)$/);
+  if (numMatch) {
+    number = numMatch[1];
+    text = numMatch[2];
   }
 
-  let number = cleanText(
-    node.find('.number, .no, .jersey, td:first-child, span:first-child').first().text()
-  );
-  let name = cleanText(
-    node.find('.name, .player-name, .player, a, td:nth-child(2)').first().text()
-  );
-  let position = cleanText(
-    node.find('.pos, .position, td:nth-child(3)').first().text()
-  );
+  // Hapus menit pergantian yang menempel (contoh: "'90", "'76", "'62", "'90+2", "90'")
+  text = text
+    .replace(/'\d{1,3}(?:\+\d+)?\s*/g, ' ')
+    .replace(/\b\d{1,3}(?:\+\d+)?'\s*/g, ' ')
+    .replace(/\s*\([A-Z]{2,3}\)\s*$/g, '')
+    .trim();
 
-  // Fallback jika nomor dan nama menyatu dalam satu teks (misal: "14 Teja Paku Alam (GK)")
-  if (!/^\d{1,2}$/.test(number) || !name || name === number) {
-    const match = fullText.match(/^#?(\d{1,2})\s+(.+?)(?:\s*\(([A-Z]{2,3})\))?$/);
-    if (match) {
-      number = match[1];
-      name = cleanText(match[2]);
-      position = position || match[3] || '';
-    } else {
-      const tailNum = fullText.match(/^(.+?)\s+#?(\d{1,2})$/);
-      if (tailNum) {
-        name = cleanText(tailNum[1]);
-        number = tailNum[2];
-      } else {
-        number = '';
-        name = fullText.replace(/\s*\([A-Z]{2,3}\)\s*$/, '').trim();
-      }
+  // Jika nomor punggung ada di akhir (contoh: "MARC KLOK 23")
+  if (!number) {
+    const tailNum = text.match(/^(.+?)\s+#?(\d{1,2})$/);
+    if (tailNum) {
+      text = tailNum[1].trim();
+      number = tailNum[2];
     }
   }
 
-  name = cleanText(name.replace(/^#?\d{1,2}\s+/, ''));
-  if (!name || name.length < 2) return null;
+  text = cleanText(text);
+  if (!text || text.length < 2 || /^\d+$/.test(text)) return null;
 
   return {
-    number: number || '',
-    name,
-    position: position || ''
+    number,
+    name: text
   };
 }
 
-function extractSideLineup($, container) {
-  const starting = [];
-  const substitutes = [];
-  let formation = '';
+function parseLineupsFromDom($, homeName, awayName) {
+  const home = { formation: '', starting: [], substitutes: [] };
+  const away = { formation: '', starting: [], substitutes: [] };
 
-  const containerText = cleanText(container.text());
-  const formMatch = containerText.match(/\b(\d-\d-\d(?:-\d)?)\b/);
-  if (formMatch) formation = formMatch[1];
+  const lineupRoot = $('#lineup, #matchlineup, .match-lineup, [id*="lineup"]').first();
+  if (!lineupRoot.length) return null;
 
-  let isBenchSection = false;
-  const rows = container.find('tr, li, .player-row, .lineup-player');
+  const rootText = cleanText(lineupRoot.text());
+  const formations = rootText.match(/\b(\d-\d-\d(?:-\d)?)\b/g) || [];
+  if (formations[0]) home.formation = formations[0];
+  if (formations[1]) away.formation = formations[1];
 
-  if (rows.length > 0) {
-    rows.each((_, el) => {
-      const rowText = cleanText($(el).text()).toLowerCase();
-      if (
-        rowText.includes('substitut') ||
-        rowText.includes('cadangan') ||
-        rowText.includes('pengganti') ||
-        rowText.includes('bench')
-      ) {
-        isBenchSection = true;
-        return;
-      }
-      if (
-        rowText.includes('starting') ||
-        rowText.includes('pemain inti') ||
-        rowText.includes('line up') ||
-        rowText.includes('line-up')
-      ) {
-        isBenchSection = false;
-        return;
-      }
+  const homeLower = homeName.toLowerCase();
+  const awayLower = awayName.toLowerCase();
 
-      const player = parsePlayerRow($, el);
-      if (!player) return;
+  // Kumpulkan token teks secara berurutan dari elemen daun (leaf nodes)
+  const tokens = [];
+  lineupRoot.find('li, tr, p, h3, h4, h5, span, div, td').each((_, el) => {
+    const node = $(el);
+    // Abaikan kontainer besar yang punya banyak anak
+    if (node.find('li, tr, p, h3, h4, h5, div, td').length > 0) return;
+    const txt = cleanText(node.text());
+    if (!txt || txt.length > 95) return;
+    if (tokens[tokens.length - 1] !== txt) {
+      tokens.push(txt);
+    }
+  });
 
-      const exists = [...starting, ...substitutes].some(
-        (p) => p.name.toLowerCase() === player.name.toLowerCase()
-      );
-      if (exists) return;
+  // Gabungkan token nomor punggung yang terpisah elemen dengan nama pemain (misal ["14", "'90", "TEJA PAKU ALAM"])
+  const mergedTokens = [];
+  for (let i = 0; i < tokens.length; i++) {
+    const cur = tokens[i];
+    const next = tokens[i + 1] || '';
+    const next2 = tokens[i + 2] || '';
 
-      if (!isBenchSection && starting.length < 11) {
-        starting.push(player);
-      } else {
-        substitutes.push(player);
-      }
-    });
+    if (/^#?\d{1,2}$/.test(cur) && /^'\d{1,3}(?:\+\d+)?$/.test(next) && next2 && !detectPositionHeader(next2.toLowerCase())) {
+      mergedTokens.push(`${cur} ${next} ${next2}`);
+      i += 2;
+    } else if (/^#?\d{1,2}$/.test(cur) && next && !detectPositionHeader(next.toLowerCase()) && !isBenchHeader(next.toLowerCase()) && next.toLowerCase() !== 'vs') {
+      mergedTokens.push(`${cur} ${next}`);
+      i += 1;
+    } else if (/^'\d{1,3}(?:\+\d+)?$/.test(cur) && next && !detectPositionHeader(next.toLowerCase())) {
+      mergedTokens.push(`${cur} ${next}`);
+      i += 1;
+    } else {
+      mergedTokens.push(cur);
+    }
   }
 
-  return { formation, starting, substitutes };
+  let currentSide = 'home';
+  let currentPos = 'MF';
+  let isBench = false;
+  let gkHeaderCount = 0;
+
+  for (const token of mergedTokens) {
+    const lower = token.toLowerCase();
+
+    // Deteksi perpindahan dari tim Home ke tim Away
+    if (lower === 'vs' || (awayLower && lower.includes(awayLower) && home.starting.length > 0)) {
+      currentSide = 'away';
+      currentPos = 'GK';
+      isBench = false;
+      continue;
+    }
+
+    const posHeader = detectPositionHeader(lower);
+    if (posHeader) {
+      if (posHeader === 'GK') {
+        gkHeaderCount += 1;
+        if (gkHeaderCount >= 2 && currentSide === 'home') {
+          currentSide = 'away';
+        }
+      }
+      currentPos = posHeader;
+      isBench = false;
+      continue;
+    }
+
+    if (isBenchHeader(lower)) {
+      isBench = true;
+      continue;
+    }
+
+    if (isNoiseLineupText(lower, homeLower, awayLower)) continue;
+
+    const parsed = cleanPlayerNameAndNumber(token);
+    if (!parsed) continue;
+
+    const target = currentSide === 'home' ? home : away;
+    const alreadyExists = [...target.starting, ...target.substitutes].some(
+      (p) => p.name.toLowerCase() === parsed.name.toLowerCase()
+    );
+    if (alreadyExists) continue;
+
+    const playerObj = {
+      number: parsed.number,
+      name: parsed.name,
+      position: currentPos
+    };
+
+    if (!isBench && target.starting.length < 11) {
+      target.starting.push(playerObj);
+    } else {
+      target.substitutes.push(playerObj);
+    }
+  }
+
+  if (home.starting.length === 0 && away.starting.length === 0) return null;
+  return { home, away };
 }
 
 module.exports = async (req, res) => {
@@ -152,8 +215,7 @@ module.exports = async (req, res) => {
   if (!id && !url) {
     return res.status(400).json({
       success: false,
-      message:
-        'Parameter "id" atau "url" wajib diisi. Contoh: /api/match-detail?id=2026-11-22/PERSIB_BANDUNG/BALI_UNITED_FC'
+      message: 'Parameter "id" atau "url" wajib diisi.'
     });
   }
 
@@ -182,6 +244,9 @@ module.exports = async (req, res) => {
     const homeSlug = urlParts[urlParts.length - 2] || 'Home';
     const dateFromUrl = urlParts[urlParts.length - 3] || null;
 
+    const homeName = homeSlug.replace(/_+/g, ' ').trim();
+    const awayName = awaySlug.replace(/_+/g, ' ').trim();
+
     // 1. Logo klub
     const clubLogos = [];
     $('img').each((_, img) => {
@@ -200,10 +265,7 @@ module.exports = async (req, res) => {
     // 2. Skor pertandingan
     let homeScore = null;
     let awayScore = null;
-    const scoreCandidates = $(
-      '.score, .match-score, .scoreboard h1, .scoreboard h2, .scoreboard h3, .result-score'
-    );
-    scoreCandidates.each((_, el) => {
+    $('.score, .match-score, .scoreboard h1, .scoreboard h2, .scoreboard h3, .result-score').each((_, el) => {
       if (homeScore !== null) return;
       const m = cleanText($(el).text()).match(/\b(\d{1,2})\s*[-:]\s*(\d{1,2})\b/);
       if (m) {
@@ -226,32 +288,45 @@ module.exports = async (req, res) => {
       }
     }
 
-    // 3. Info Pertandingan (Stadion, Wasit, Kick-off, Penonton)
+    // 3. Info Pertandingan (Stadion, Kick-off, Wasit, Penonton)
     let venue = '';
     let referee = '';
     let kickoff = '';
     let attendance = '';
 
     $('li, tr, p, div, span').each((_, el) => {
-      if ($(el).children().length > 4) return;
+      if ($(el).children().length > 3) return;
       const text = cleanText($(el).text());
-      if (!text || text.length > 140) return;
+      if (!text || text.length > 110) return;
 
-      if (!venue && /(stadion|stadium|gelora|arena|venue)/i.test(text)) {
-        const cleaned = text.replace(/^(stadion|stadium|venue)\s*:?\s*/i, '').trim();
-        if (cleaned.length >= 4 && cleaned.length <= 90) venue = cleaned;
+      // Kick-off: dukung format 19:00 atau 19.00
+      if (!kickoff) {
+        const timeMatch = text.match(/\b([01]?\d|2[0-3])[:.]([0-5]\d)(?:\s*(WIB|WITA|WIT))?\b/i);
+        if (timeMatch && !text.includes('90+')) {
+          kickoff = `${timeMatch[1].padStart(2, '0')}:${timeMatch[2]} ${(timeMatch[3] || 'WIB').toUpperCase()}`;
+        }
       }
+
+      // Stadion: wajib mengandung kata stadion/gelora/arena dan bukan tanggal
+      if (
+        !venue &&
+        /(stadion|stadium|gelora|arena)/i.test(text) &&
+        !/^(senin|selasa|rabu|kamis|jumat|sabtu|minggu)/i.test(text)
+      ) {
+        const cleaned = text.replace(/^(stadion|stadium|venue)\s*:?\s*/i, '').trim();
+        if (cleaned.length >= 5 && cleaned.length <= 80) venue = cleaned;
+      }
+
+      // Wasit
       if (!referee && /(wasit|referee)/i.test(text)) {
         const cleaned = text.replace(/^(wasit|referee)\s*:?\s*/i, '').trim();
-        if (cleaned.length >= 3 && cleaned.length <= 70) referee = cleaned;
+        if (cleaned.length >= 3 && cleaned.length <= 65) referee = cleaned;
       }
+
+      // Penonton: wajib >= 3 digit agar tidak mengambil jam 19 dari 19:00
       if (!attendance && /(penonton|attendance)/i.test(text)) {
-        const numMatch = text.match(/[\d.,]{2,}/);
-        if (numMatch) attendance = numMatch[0];
-      }
-      if (!kickoff && /\b([01]?\d|2[0-3]):[0-5]\d\b/.test(text) && text.length <= 45) {
-        const timeMatch = text.match(/\b([01]?\d|2[0-3]):[0-5]\d(?:\s*WIB|\s*WITA|\s*WIT)?/i);
-        if (timeMatch) kickoff = timeMatch[0].toUpperCase();
+        const attMatch = text.match(/\b(\d{1,3}(?:[.,]\d{3})+|\d{3,6})\b/);
+        if (attMatch) attendance = attMatch[1];
       }
     });
 
@@ -265,42 +340,39 @@ module.exports = async (req, res) => {
 
       if (label && homeVal !== '' && awayVal !== '') {
         if (!statistics.some((s) => s.label === label)) {
-          statistics.push({
-            label,
-            home: homeVal,
-            away: awayVal
-          });
+          statistics.push({ label, home: homeVal, away: awayVal });
         }
       }
     });
 
-    // 5. Kejadian Pertandingan / Linimasa
+    // 5. Susunan Pemain
+    const lineups = parseLineupsFromDom($, homeName, awayName);
+
+    // 6. Linimasa / Kejadian Pertandingan
     const events = [];
     const seenEvents = new Set();
+    const homePlayerNames = lineups
+      ? [...lineups.home.starting, ...lineups.home.substitutes].map((p) => p.name.toLowerCase())
+      : [];
+    const awayPlayerNames = lineups
+      ? [...lineups.away.starting, ...lineups.away.substitutes].map((p) => p.name.toLowerCase())
+      : [];
 
-    const timelineSelectors = [
-      '#matchtimeline li',
-      '#live_timeline li',
-      '#summary li',
-      '.match-timeline li',
-      '.timeline li',
-      '#matchtimeline tr',
-      '#live_timeline tr',
-      '#summary tr',
-      '.timeline tr',
-      '[id*="timeline"] li',
-      '[id*="timeline"] tr'
-    ].join(', ');
+    const eventContainers = $('#matchtimeline, #live_timeline, #summary, .match-timeline, [id*="timeline"]');
+    const eventRows = eventContainers.length
+      ? eventContainers.find('li, tr, .timeline-item, .event-item, .row')
+      : $('li, tr');
 
-    $(timelineSelectors).each((_, el) => {
+    eventRows.each((_, el) => {
       const row = $(el);
-      const fullText = cleanText(row.text());
-      if (!fullText || fullText.length > 220) return;
+      // Hindari baris lineup yang punya nomor punggung + nama
+      if (row.closest('#lineup, #matchlineup, [id*="lineup"]').length > 0) return;
 
-      // Cari menit baik di .center, .minute, .time, maupun di teks baris (42', '42, 90+5')
-      const centerText = cleanText(row.find('.center, .minute, .time').first().text());
-      const minSource = centerText || fullText;
-      const minMatch = minSource.match(/(?:'(\d{1,3}(?:\+\d+)?)|(\d{1,3}(?:\+\d+)?)'?)/);
+      const fullText = cleanText(row.text());
+      if (!fullText || fullText.length > 200) return;
+
+      // Wajib ada format menit dengan tanda petik ('42 atau 42' atau '90+5)
+      const minMatch = fullText.match(/(?:'(\d{1,3}(?:\+\d+)?)|(\d{1,3}(?:\+\d+)?)')/);
       if (!minMatch) return;
 
       const minuteNum = minMatch[1] || minMatch[2];
@@ -309,20 +381,29 @@ module.exports = async (req, res) => {
       const leftText = cleanText(row.find('.left, td:first-child').first().text());
       const rightText = cleanText(row.find('.right, td:last-child').first().text());
 
-      let team = null;
       let detail = '';
+      let sideHint = '';
 
       if (leftText && !leftText.includes(minuteNum) && (!rightText || rightText.includes(minuteNum))) {
-        team = 'home';
+        sideHint = 'home';
         detail = leftText;
       } else if (rightText && !rightText.includes(minuteNum) && (!leftText || leftText.includes(minuteNum))) {
-        team = 'away';
+        sideHint = 'away';
         detail = rightText;
       } else {
-        // Deteksi posisi dari class atau urutan elemen
-        const htmlStr = (row.html() || '').toLowerCase();
-        team = htmlStr.includes('right') || htmlStr.includes('away') ? 'away' : 'home';
         detail = cleanText(fullText.replace(new RegExp(`'?${minuteNum.replace('+', '\\+')}'?`, 'g'), ''));
+      }
+
+      detail = cleanText(detail.replace(/^[-–•:]+\s*|\s*[-–•:]+$/g, ''));
+      if (!detail || detail.length < 2) return;
+
+      // Cocokkan nama pemain dengan roster Home/Away jika tersedia
+      const detailLower = detail.toLowerCase();
+      let team = sideHint || 'home';
+      if (awayPlayerNames.some((n) => n && (detailLower.includes(n) || n.includes(detailLower)))) {
+        team = 'away';
+      } else if (homePlayerNames.some((n) => n && (detailLower.includes(n) || n.includes(detailLower)))) {
+        team = 'home';
       }
 
       const imgSrcs = row
@@ -333,61 +414,13 @@ module.exports = async (req, res) => {
         .toLowerCase();
 
       const type = detectEventType((row.html() || '').toLowerCase(), imgSrcs, fullText.toLowerCase());
-      const cleanDetail = cleanText(detail.replace(/^[-–•:]+\s*|\s*[-–•:]+$/g, ''));
-      if (!cleanDetail) return;
+      const eventKey = `${minute}-${team}-${type}-${detail}`;
 
-      const eventKey = `${minute}-${team}-${type}-${cleanDetail}`;
       if (!seenEvents.has(eventKey)) {
         seenEvents.add(eventKey);
-        events.push({
-          minute,
-          team,
-          type,
-          player: cleanDetail
-        });
+        events.push({ minute, team, type, player: detail });
       }
     });
-
-    // 6. Susunan Pemain (#lineup / #matchlineup)
-    let homeLineup = { formation: '', starting: [], substitutes: [] };
-    let awayLineup = { formation: '', starting: [], substitutes: [] };
-
-    const lineupRoot = $('#lineup, #matchlineup, .match-lineup, [id*="lineup"]').first();
-    if (lineupRoot.length > 0) {
-      // Cek apakah dipisah berdasarkan kolom kiri/kanan atau 2 sub-kontainer
-      const leftCol = lineupRoot.find('.left, .home-lineup, .col-md-6:first-child, .col-6:first-child, .col-lg-6:first-child').first();
-      const rightCol = lineupRoot.find('.right, .away-lineup, .col-md-6:last-child, .col-6:last-child, .col-lg-6:last-child').first();
-
-      if (leftCol.length > 0 && rightCol.length > 0 && leftCol[0] !== rightCol[0]) {
-        homeLineup = extractSideLineup($, leftCol);
-        awayLineup = extractSideLineup($, rightCol);
-      } else {
-        const tablesOrLists = lineupRoot.find('table, ul');
-        if (tablesOrLists.length >= 2) {
-          homeLineup = extractSideLineup($, tablesOrLists.eq(0));
-          awayLineup = extractSideLineup($, tablesOrLists.eq(1));
-        } else {
-          // Format 1 baris kiri-kanan (.left = home player, .right = away player)
-          lineupRoot.find('li, tr').each((_, el) => {
-            const leftEl = $(el).find('.left, td:first-child').first();
-            const rightEl = $(el).find('.right, td:last-child').first();
-            const hPlayer = leftEl.length ? parsePlayerRow($, leftEl) : null;
-            const aPlayer = rightEl.length ? parsePlayerRow($, rightEl) : null;
-
-            if (hPlayer) {
-              if (homeLineup.starting.length < 11) homeLineup.starting.push(hPlayer);
-              else homeLineup.substitutes.push(hPlayer);
-            }
-            if (aPlayer) {
-              if (awayLineup.starting.length < 11) awayLineup.starting.push(aPlayer);
-              else awayLineup.substitutes.push(aPlayer);
-            }
-          });
-        }
-      }
-    }
-
-    const hasLineups = homeLineup.starting.length > 0 || awayLineup.starting.length > 0;
 
     res.status(200).json({
       success: true,
@@ -401,23 +434,18 @@ module.exports = async (req, res) => {
         referee: referee || null,
         attendance: attendance || null,
         home: {
-          name: homeSlug.replace(/_+/g, ' ').trim(),
+          name: homeName,
           logo: clubLogos[0] || null,
           score: homeScore
         },
         away: {
-          name: awaySlug.replace(/_+/g, ' ').trim(),
+          name: awayName,
           logo: clubLogos[1] || null,
           score: awayScore
         },
         events,
         statistics,
-        lineups: hasLineups
-          ? {
-              home: homeLineup,
-              away: awayLineup
-            }
-          : null
+        lineups
       }
     });
   } catch (error) {
